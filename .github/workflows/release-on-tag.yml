@@ -10,6 +10,11 @@ on:
         description: 'Existing tag to (re-)release'
         required: true
         type: string
+      replace_existing:
+        description: 'Rebuild and replace an existing Release asset'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: write
@@ -35,7 +40,7 @@ jobs:
           esac
 
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.meta.outputs.tag }}
           fetch-depth: 0
@@ -49,15 +54,22 @@ jobs:
           }
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 
       - name: Build and publish ${{ steps.meta.outputs.tag }}
         env:
           GH_TOKEN: ${{ github.token }}
-        # Use the publisher from main so old tags can also be rebuilt safely.
-        run: bash <(git show origin/main:.github/scripts/release-tag.sh) '${{ steps.meta.outputs.tag }}'
+          # Use the publisher from main so old tags can also be rebuilt safely.
+          # The pack-from-source helper is also fetched from main because
+          # release-tag.sh is run via `git show` (process substitution), so it
+          # cannot locate sibling scripts by $(dirname "$0").
+          PACK_OSU_FROM_SOURCE_SCRIPT: ${{ runner.temp }}/pack-osu-from-source.sh
+          REPLACE_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_existing || false }}
+        run: |
+          git show origin/main:.github/scripts/pack-osu-from-source.sh > "$PACK_OSU_FROM_SOURCE_SCRIPT"
+          bash <(git show origin/main:.github/scripts/release-tag.sh) '${{ steps.meta.outputs.tag }}'
 
       - name: Start lazer and tachyon synchronization
         if: steps.meta.outputs.is_manual == 'true'

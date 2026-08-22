@@ -21,10 +21,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     outputs:
-      release_tags: ${{ steps.release-tags.outputs.tags }}
+      release_targets: ${{ steps.release-targets.outputs.targets }}
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
@@ -92,11 +92,13 @@ jobs:
             done <<< "$NUGET_VERSIONS"
 
             if [ -z "$selected" ]; then
-              echo "::error::No ppy.osu.Game package <= $target is available for $channel." >&2
-              return 1
+              # The release publisher will build the exact version from the
+              # ppy/osu channel tag, so do not fail discovery here.
+              echo "::notice::No ppy.osu.Game package <= $target is on nuget.org for $channel; will pack from source." >&2
+              return 0
             fi
             if [ "$selected" != "$target" ]; then
-              echo "::warning::ppy.osu.Game $target for $channel is not published; using newest compatible NuGet $selected (<= $target)." >&2
+              echo "::notice::ppy.osu.Game $target not on nuget.org for $channel; the source-pack fallback will build it." >&2
             fi
             printf '%s' "$selected"
           }
@@ -104,61 +106,97 @@ jobs:
           LAZER_NUGET="$(select_nuget_version lazer "$LAZER_BARE")"
           TACHYON_NUGET="$(select_nuget_version tachyon "$TACHYON_BARE")"
 
+          # ppy/osu never publishes channel tags (-lazer/-tachyon) to nuget.org
+          # (deploy.yml excludes `*-*`). When the exact package for a channel's
+          # upstream version is absent, build it from the ppy/osu channel tag so
+          # the package embeds that tag's CURRENT_RULESET_API_VERSION. The ruleset
+          # is compiled against that same API version and therefore matches the
+          # channel client exactly. The fallback package version then equals the
+          # target version; sync-channel.sh still bumps/commits normally.
+          LAZER_PACK_FROM_SOURCE=false
+          TACHYON_PACK_FROM_SOURCE=false
+          if [ -z "$LAZER_NUGET" ] || [ "$LAZER_NUGET" != "$LAZER_BARE" ]; then
+            LAZER_PACK_FROM_SOURCE=true
+            LAZER_NUGET="$LAZER_BARE"
+            echo "::notice::ppy.osu.Game $LAZER_BARE not on nuget.org for lazer; will pack from ppy/osu tag ${LAZER_BARE}-lazer."
+          fi
+          if [ -z "$TACHYON_NUGET" ] || [ "$TACHYON_NUGET" != "$TACHYON_BARE" ]; then
+            TACHYON_PACK_FROM_SOURCE=true
+            TACHYON_NUGET="$TACHYON_BARE"
+            echo "::notice::ppy.osu.Game $TACHYON_BARE not on nuget.org for tachyon; will pack from ppy/osu tag ${TACHYON_BARE}-tachyon."
+          fi
+
           echo "lazer_bare=$LAZER_BARE" >> "$GITHUB_OUTPUT"
           echo "tachyon_bare=$TACHYON_BARE" >> "$GITHUB_OUTPUT"
           echo "lazer_nuget=$LAZER_NUGET" >> "$GITHUB_OUTPUT"
           echo "tachyon_nuget=$TACHYON_NUGET" >> "$GITHUB_OUTPUT"
+          echo "lazer_pack_from_source=$LAZER_PACK_FROM_SOURCE" >> "$GITHUB_OUTPUT"
+          echo "tachyon_pack_from_source=$TACHYON_PACK_FROM_SOURCE" >> "$GITHUB_OUTPUT"
           echo "::notice::ppy/osu lazer latest: $LAZER"
           echo "::notice::ppy/osu tachyon latest: $TACHYON"
-          echo "::notice::Selected ppy.osu.Game for lazer: ${LAZER_NUGET:-<waiting>}"
-          echo "::notice::Selected ppy.osu.Game for tachyon: ${TACHYON_NUGET:-<waiting>}"
+          LAZER_SOURCE_LABEL=""
+          TACHYON_SOURCE_LABEL=""
+          [ "$LAZER_PACK_FROM_SOURCE" = true ] && LAZER_SOURCE_LABEL=" (from source)"
+          [ "$TACHYON_PACK_FROM_SOURCE" = true ] && TACHYON_SOURCE_LABEL=" (from source)"
+          echo "::notice::Selected ppy.osu.Game for lazer: $LAZER_NUGET$LAZER_SOURCE_LABEL"
+          echo "::notice::Selected ppy.osu.Game for tachyon: $TACHYON_NUGET$TACHYON_SOURCE_LABEL"
 
       - name: Sync lazer channel
         id: lazer
         env:
           GH_TOKEN: ${{ github.token }}
+          PACK_FROM_SOURCE: ${{ steps.ppy.outputs.lazer_pack_from_source }}
         run: bash .github/scripts/sync-channel.sh lazer '${{ steps.ppy.outputs.lazer_bare }}' '${{ steps.ppy.outputs.lazer_nuget }}'
 
       - name: Sync tachyon channel
         id: tachyon
         env:
           GH_TOKEN: ${{ github.token }}
+          PACK_FROM_SOURCE: ${{ steps.ppy.outputs.tachyon_pack_from_source }}
         run: bash .github/scripts/sync-channel.sh tachyon '${{ steps.ppy.outputs.tachyon_bare }}' '${{ steps.ppy.outputs.tachyon_nuget }}'
 
-      - name: Collect tags that need a GitHub Release
-        id: release-tags
+      - name: Collect releases to publish or repair
+        id: release-targets
         env:
           LAZER_TAG: ${{ steps.lazer.outputs.release_tag }}
           TACHYON_TAG: ${{ steps.tachyon.outputs.release_tag }}
+          LAZER_REPLACE: ${{ steps.lazer.outputs.replace_existing }}
+          TACHYON_REPLACE: ${{ steps.tachyon.outputs.replace_existing }}
         run: |
           set -euo pipefail
-          TAGS=()
-          [ -n "$LAZER_TAG" ] && TAGS+=("$LAZER_TAG")
-          [ -n "$TACHYON_TAG" ] && TAGS+=("$TACHYON_TAG")
+          TARGETS=()
+          if [ -n "$LAZER_TAG" ]; then
+            TARGETS+=("$(jq -cn --arg tag "$LAZER_TAG" --arg replace "${LAZER_REPLACE:-false}" \
+              '{tag: $tag, replace_existing: ($replace == "true")}')")
+          fi
+          if [ -n "$TACHYON_TAG" ]; then
+            TARGETS+=("$(jq -cn --arg tag "$TACHYON_TAG" --arg replace "${TACHYON_REPLACE:-false}" \
+              '{tag: $tag, replace_existing: ($replace == "true")}')")
+          fi
 
-          if [ "${#TAGS[@]}" -eq 0 ]; then
-            echo 'tags=[]' >> "$GITHUB_OUTPUT"
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo 'targets=[]' >> "$GITHUB_OUTPUT"
           else
-            printf 'tags=%s\n' "$(printf '%s\n' "${TAGS[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            printf 'targets=%s\n' "$(printf '%s\n' "${TARGETS[@]}" | jq -sc .)" >> "$GITHUB_OUTPUT"
           fi
 
   release:
     needs: sync
-    if: needs.sync.outputs.release_tags != '[]'
+    if: needs.sync.outputs.release_targets != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        tag: ${{ fromJSON(needs.sync.outputs.release_tags) }}
+        include: ${{ fromJSON(needs.sync.outputs.release_targets) }}
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ matrix.tag }}
           fetch-depth: 0
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 
@@ -168,4 +206,8 @@ jobs:
       - name: Build and publish ${{ matrix.tag }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash <(git show origin/main:.github/scripts/release-tag.sh) '${{ matrix.tag }}'
+          PACK_OSU_FROM_SOURCE_SCRIPT: ${{ runner.temp }}/pack-osu-from-source.sh
+          REPLACE_EXISTING: ${{ matrix.replace_existing }}
+        run: |
+          git show origin/main:.github/scripts/pack-osu-from-source.sh > "$PACK_OSU_FROM_SOURCE_SCRIPT"
+          bash <(git show origin/main:.github/scripts/release-tag.sh) '${{ matrix.tag }}'

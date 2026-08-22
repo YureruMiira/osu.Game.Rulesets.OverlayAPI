@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PpyOsuGameVersion>2026.730.0</PpyOsuGameVersion>
+    <PpyOsuGameSourceChannel>nuget</PpyOsuGameSourceChannel>
 
     <Product>OverlayAPI</Product>
     <Authors>Milkitic</Authors>

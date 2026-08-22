@@ -4,7 +4,10 @@
 # Usage: sync-channel.sh <channel> <ppy_bare_version> <nuget_version>
 #   channel       : lazer | tachyon
 #   ppy_bare_ver  : e.g. 2026.624.0 (without the -lazer/-tachyon suffix)
-#   nuget_version : newest stable ppy.osu.Game version <= ppy_bare_ver
+#   nuget_version : exact ppy.osu.Game build version (official or source-built)
+#
+# Environment:
+#   PACK_FROM_SOURCE : true when the package must be built from this channel tag
 #
 # Tag conventions:
 #   v{base}-{channel}.{osuVer}  e.g. v0.2.0-lazer.2026.624.0
@@ -23,6 +26,7 @@ set -euo pipefail
 CHANNEL="${1:-}"
 TARGET_VER="${2:-}"
 NUGET_VER="${3:-}"
+PACK_FROM_SOURCE="${PACK_FROM_SOURCE:-false}"
 CSPROJ="osu.Game.Rulesets.OverlayAPI/osu.Game.Rulesets.OverlayAPI.csproj"
 
 if [[ ! "$CHANNEL" =~ ^(lazer|tachyon)$ ]] || [[ ! "$TARGET_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -30,8 +34,21 @@ if [[ ! "$CHANNEL" =~ ^(lazer|tachyon)$ ]] || [[ ! "$TARGET_VER" =~ ^[0-9]+\.[0-
   exit 1
 fi
 
+if [[ ! "$PACK_FROM_SOURCE" =~ ^(true|false)$ ]]; then
+  echo "::error::PACK_FROM_SOURCE must be 'true' or 'false'."
+  exit 1
+fi
+
+if [ "$PACK_FROM_SOURCE" = true ]; then
+  TARGET_SOURCE_CHANNEL="$CHANNEL"
+else
+  TARGET_SOURCE_CHANNEL="nuget"
+fi
+
 write_output() {
-  [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+  fi
 }
 
 # True when $1 is greater than or equal to $2 according to NuGet-style numeric versions.
@@ -39,8 +56,28 @@ version_at_least() {
   [ "$1" = "$2" ] || [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]
 }
 
-release_exists() {
-  gh release view "$1" >/dev/null 2>&1
+# Schedule a missing release, or a one-time replacement when its notes prove it
+# was built against a different dependency version. release-tag.sh performs the
+# actual safe --clobber operation when replace_existing is true.
+schedule_release() {
+  local tag="$1" expected_version="$2" release_state
+  if release_state="$(gh release view "$tag" --json body,assets \
+    --template '{{.body}}{{"\n"}}{{range .assets}}{{.name}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+    if grep -Fqx -- "- ppy.osu.Game: \`${expected_version}\`" <<< "$release_state" \
+      && grep -Fqx -- "osu.Game.Rulesets.OverlayAPI.dll" <<< "$release_state"; then
+      echo "Tag and GitHub Release $tag already have the expected dependency and asset."
+      write_output release_tag ""
+      write_output replace_existing false
+    else
+      echo "::warning::GitHub Release $tag has stale metadata or a missing asset; scheduling a corrective rebuild."
+      write_output release_tag "$tag"
+      write_output replace_existing true
+    fi
+  else
+    echo "::notice::GitHub Release $tag is missing; scheduling publication."
+    write_output release_tag "$tag"
+    write_output replace_existing false
+  fi
 }
 
 read_project_version() {
@@ -50,6 +87,12 @@ read_project_version() {
     version="$(sed -n 's/.*<PackageReference *Include="ppy\.osu\.Game" *Version="\([^"]*\)".*/\1/p' "$CSPROJ" | head -1)"
   fi
   printf '%s' "$version"
+}
+
+read_project_source_channel() {
+  local source
+  source="$(sed -n 's/.*<PpyOsuGameSourceChannel>\([^<]*\)<\/PpyOsuGameSourceChannel>.*/\1/p' "$CSPROJ" | head -1)"
+  printf '%s' "${source:-nuget}"
 }
 
 read_tag_version() {
@@ -62,12 +105,18 @@ read_tag_version() {
   printf '%s' "$version"
 }
 
-set_project_version() {
-  local version="$1"
+set_project_target() {
+  local version="$1" source_channel="$2"
   if grep -q '<PpyOsuGameVersion>' "$CSPROJ"; then
     sed -i -E "s|(<PpyOsuGameVersion>)[^<]+(</PpyOsuGameVersion>)|\1${version}\2|" "$CSPROJ"
   else
     sed -i -E "s|(<PackageReference *Include=\"ppy\.osu\.Game\" *Version=\")[^\"]+(\" *)|\1${version}\2|" "$CSPROJ"
+  fi
+
+  if grep -q '<PpyOsuGameSourceChannel>' "$CSPROJ"; then
+    sed -i -E "s|(<PpyOsuGameSourceChannel>)[^<]+(</PpyOsuGameSourceChannel>)|\1${source_channel}\2|" "$CSPROJ"
+  else
+    sed -i "/<PropertyGroup Label=\"Project\">/a\\    <PpyOsuGameSourceChannel>${source_channel}</PpyOsuGameSourceChannel>" "$CSPROJ"
   fi
 }
 
@@ -91,6 +140,8 @@ find_highest_manual_base() {
 }
 
 echo "::group::Channel: $CHANNEL (target osu! version: $TARGET_VER)"
+write_output release_tag ""
+write_output replace_existing false
 
 if [ -z "$NUGET_VER" ]; then
   echo "::notice::No published ppy.osu.Game package is available for $CHANNEL $TARGET_VER yet; waiting."
@@ -143,18 +194,19 @@ if [ -n "$LOCAL_OSU_VER" ] && [ "$TARGET_VER" = "$LOCAL_OSU_VER" ]; then
 
   if [ -n "$MANUAL_BASE" ] && [ "$MANUAL_BASE" != "$LOCAL_BASE" ] && version_at_least "$MANUAL_BASE" "$LOCAL_BASE"; then
     CURRENT_CSPROJ_VER="$(read_project_version)"
+    CURRENT_SOURCE_CHANNEL="$(read_project_source_channel)"
     if [[ ! "$CURRENT_CSPROJ_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "::error::Could not read ppy.osu.Game version from $CSPROJ"
       exit 1
     fi
 
-    if [ "$CURRENT_CSPROJ_VER" != "$NUGET_VER" ]; then
-      set_project_version "$NUGET_VER"
+    if [ "$CURRENT_CSPROJ_VER" != "$NUGET_VER" ] || [ "$CURRENT_SOURCE_CHANNEL" != "$TARGET_SOURCE_CHANNEL" ]; then
+      set_project_target "$NUGET_VER" "$TARGET_SOURCE_CHANNEL"
       git add "$CSPROJ"
       git commit -m "chore(${CHANNEL}): target ppy.osu.Game ${NUGET_VER} for manual base ${MANUAL_BASE}"
-      echo "Committed the real $CHANNEL dependency change: $CURRENT_CSPROJ_VER -> $NUGET_VER."
+      echo "Committed the real $CHANNEL dependency target: $CURRENT_CSPROJ_VER/$CURRENT_SOURCE_CHANNEL -> $NUGET_VER/$TARGET_SOURCE_CHANNEL."
     else
-      echo "The selected dependency is already present; no channel commit is needed."
+      echo "The selected dependency and source channel are already present; no channel commit is needed."
     fi
 
     NEW_TAG="v${MANUAL_BASE}-${CHANNEL}.${TARGET_VER}"
@@ -168,30 +220,17 @@ if [ -n "$LOCAL_OSU_VER" ] && [ "$TARGET_VER" = "$LOCAL_OSU_VER" ]; then
       git push origin "$NEW_TAG"
     fi
 
-    if release_exists "$NEW_TAG"; then
-      write_output release_tag ""
-    else
-      write_output release_tag "$NEW_TAG"
-    fi
+    schedule_release "$NEW_TAG" "$NUGET_VER"
     echo "::endgroup::"
     exit 0
   fi
 
   TAG_CSPROJ_VER="$(read_tag_version "$LOCAL_TAG")"
   if [ "$TAG_CSPROJ_VER" != "$NUGET_VER" ]; then
-    echo "::warning::Existing tag $LOCAL_TAG references ppy.osu.Game ${TAG_CSPROJ_VER:-<unknown>}, not the selected published package $NUGET_VER; it is not safe to release."
-    write_output release_tag ""
-    echo "::endgroup::"
-    exit 0
+    echo "::warning::Existing tag $LOCAL_TAG records ppy.osu.Game ${TAG_CSPROJ_VER:-<unknown>}, not $NUGET_VER. The publisher will override it from the immutable channel tag."
   fi
 
-  if release_exists "$LOCAL_TAG"; then
-    echo "Tag and GitHub Release are already current."
-    write_output release_tag ""
-  else
-    echo "::notice::Tag $LOCAL_TAG exists but its GitHub Release is missing; scheduling a catch-up publish."
-    write_output release_tag "$LOCAL_TAG"
-  fi
+  schedule_release "$LOCAL_TAG" "$NUGET_VER"
   echo "::endgroup::"
   exit 0
 fi
@@ -199,19 +238,20 @@ fi
 echo "Target $TARGET_VER is newer than ${LOCAL_OSU_VER:-<no channel tag>}; update needed."
 
 CURRENT_CSPROJ_VER="$(read_project_version)"
+CURRENT_SOURCE_CHANNEL="$(read_project_source_channel)"
 if [[ ! "$CURRENT_CSPROJ_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "::error::Could not read ppy.osu.Game version from $CSPROJ"
   exit 1
 fi
-echo "Current ppy.osu.Game dependency: $CURRENT_CSPROJ_VER (selected package: $NUGET_VER)"
+echo "Current ppy.osu.Game dependency: $CURRENT_CSPROJ_VER/$CURRENT_SOURCE_CHANNEL (selected: $NUGET_VER/$TARGET_SOURCE_CHANNEL)"
 
-if [ "$CURRENT_CSPROJ_VER" = "$NUGET_VER" ]; then
-  echo "Dependency is already the selected published package; using the current main commit for the catch-up tag."
+if [ "$CURRENT_CSPROJ_VER" = "$NUGET_VER" ] && [ "$CURRENT_SOURCE_CHANNEL" = "$TARGET_SOURCE_CHANNEL" ]; then
+  echo "Dependency and source channel are already selected; using the current main commit for the catch-up tag."
 else
-  set_project_version "$NUGET_VER"
+  set_project_target "$NUGET_VER" "$TARGET_SOURCE_CHANNEL"
   git add "$CSPROJ"
   git commit -m "chore(${CHANNEL}): bump ppy.osu.Game to ${NUGET_VER} for osu! ${TARGET_VER}"
-  echo "Committed ppy.osu.Game bump to $NUGET_VER."
+  echo "Committed ppy.osu.Game target $NUGET_VER/$TARGET_SOURCE_CHANNEL."
 fi
 
 # A manual code release sets the base for future channel releases. This does
@@ -243,11 +283,6 @@ if ! git ls-remote --exit-code --tags origin "refs/tags/$NEW_TAG" >/dev/null 2>&
   echo "::notice::Pushed $NEW_TAG"
 fi
 
-if release_exists "$NEW_TAG"; then
-  echo "GitHub Release $NEW_TAG already exists."
-  write_output release_tag ""
-else
-  write_output release_tag "$NEW_TAG"
-fi
+schedule_release "$NEW_TAG" "$NUGET_VER"
 
 echo "::endgroup::"
