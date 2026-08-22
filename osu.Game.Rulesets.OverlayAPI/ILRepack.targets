@@ -23,9 +23,5 @@
         TargetKind="Dll"
         OutputFile="$(OutputPath)$(AssemblyName).dll"
     />
-
-    <!-- The release publisher removes and then requires this marker. This
-         turns a silently skipped ILRepack target into a hard CI failure. -->
-    <Touch Files="$(OutputPath)$(AssemblyName).ilrepack.success" AlwaysCreate="true" />
   </Target>
 </Project>

@@ -62,13 +62,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # Use the publisher from main so old tags can also be rebuilt safely.
-          # The pack-from-source helper is also fetched from main because
+          # Release helpers are also fetched from main because
           # release-tag.sh is run via `git show` (process substitution), so it
           # cannot locate sibling scripts by $(dirname "$0").
           PACK_OSU_FROM_SOURCE_SCRIPT: ${{ runner.temp }}/pack-osu-from-source.sh
+          VERIFY_MERGED_ASSEMBLY_SCRIPT: ${{ runner.temp }}/verify-merged-assembly.ps1
           REPLACE_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_existing || false }}
         run: |
           git show origin/main:.github/scripts/pack-osu-from-source.sh > "$PACK_OSU_FROM_SOURCE_SCRIPT"
+          git show origin/main:.github/scripts/verify-merged-assembly.ps1 > "$VERIFY_MERGED_ASSEMBLY_SCRIPT"
           bash <(git show origin/main:.github/scripts/release-tag.sh) '${{ steps.meta.outputs.tag }}'
 
       - name: Start lazer and tachyon synchronization

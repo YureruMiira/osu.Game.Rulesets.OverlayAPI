@@ -5,7 +5,6 @@ set -euo pipefail
 TAG="${1:-}"
 PROJECT="osu.Game.Rulesets.OverlayAPI/osu.Game.Rulesets.OverlayAPI.csproj"
 ARTIFACT="osu.Game.Rulesets.OverlayAPI/bin/Release/net8.0/osu.Game.Rulesets.OverlayAPI.dll"
-ILREPACK_MARKER="osu.Game.Rulesets.OverlayAPI/bin/Release/net8.0/osu.Game.Rulesets.OverlayAPI.ilrepack.success"
 REPLACE_EXISTING="${REPLACE_EXISTING:-false}"
 
 if [ -z "$TAG" ]; then
@@ -124,7 +123,6 @@ fi
 # main. Configuration must match the following no-restore build: ILRepack is a
 # Release-only PackageReference and a default Debug restore omits its targets.
 dotnet restore "$PROJECT" -p:Configuration=Release "${BUILD_VERSION_ARGS[@]}" "${RESTORE_SOURCE_ARGS[@]}"
-rm -f "$ILREPACK_MARKER"
 dotnet build "$PROJECT" -c Release --no-restore "${BUILD_VERSION_ARGS[@]}"
 
 if [ ! -f "$ARTIFACT" ]; then
@@ -132,10 +130,12 @@ if [ ! -f "$ARTIFACT" ]; then
   exit 1
 fi
 
-if [ ! -f "$ILREPACK_MARKER" ]; then
-  echo "::error::ILRepack did not run; refusing to publish an assembly with external project dependencies."
+VERIFY_HELPER="${VERIFY_MERGED_ASSEMBLY_SCRIPT:-$(dirname "$0")/verify-merged-assembly.ps1}"
+if [ ! -f "$VERIFY_HELPER" ]; then
+  echo "::error::Merged assembly verifier was not found: $VERIFY_HELPER"
   exit 1
 fi
+pwsh -NoLogo -NoProfile -File "$VERIFY_HELPER" "$ARTIFACT"
 
 COMMIT="$(git rev-parse --short=12 HEAD)"
 NOTES="$(printf '%s\n\n- Channel: `%s`\n- osu! target: `%s`\n- ppy.osu.Game: `%s`\n- Source commit: `%s`\n\nThe single DLL asset is the final ILRepack ruleset assembly; copy it into the osu! `rulesets` directory.' \
