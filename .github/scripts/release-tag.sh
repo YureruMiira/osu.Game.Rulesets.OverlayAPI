@@ -5,6 +5,7 @@ set -euo pipefail
 TAG="${1:-}"
 PROJECT="osu.Game.Rulesets.OverlayAPI/osu.Game.Rulesets.OverlayAPI.csproj"
 ARTIFACT="osu.Game.Rulesets.OverlayAPI/bin/Release/net8.0/osu.Game.Rulesets.OverlayAPI.dll"
+ILREPACK_MARKER="osu.Game.Rulesets.OverlayAPI/bin/Release/net8.0/osu.Game.Rulesets.OverlayAPI.ilrepack.success"
 REPLACE_EXISTING="${REPLACE_EXISTING:-false}"
 
 if [ -z "$TAG" ]; then
@@ -120,12 +121,19 @@ if [ -n "$LOCAL_NUGET_DIR" ]; then
 fi
 
 # Restore explicitly so historical tags do not need a NuGet.config file from
-# main. Build then consumes the exact resolved assets without another restore.
-dotnet restore "$PROJECT" "${BUILD_VERSION_ARGS[@]}" "${RESTORE_SOURCE_ARGS[@]}"
+# main. Configuration must match the following no-restore build: ILRepack is a
+# Release-only PackageReference and a default Debug restore omits its targets.
+dotnet restore "$PROJECT" -p:Configuration=Release "${BUILD_VERSION_ARGS[@]}" "${RESTORE_SOURCE_ARGS[@]}"
+rm -f "$ILREPACK_MARKER"
 dotnet build "$PROJECT" -c Release --no-restore "${BUILD_VERSION_ARGS[@]}"
 
 if [ ! -f "$ARTIFACT" ]; then
   echo "::error::Expected final ILRepack artifact was not found: $ARTIFACT"
+  exit 1
+fi
+
+if [ ! -f "$ILREPACK_MARKER" ]; then
+  echo "::error::ILRepack did not run; refusing to publish an assembly with external project dependencies."
   exit 1
 fi
 
