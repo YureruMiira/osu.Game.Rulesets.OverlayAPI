@@ -4,8 +4,8 @@
     <OutputType>Library</OutputType>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <PpyOsuGameVersion>2026.804.2</PpyOsuGameVersion>
-    <PpyOsuGameSourceChannel>lazer</PpyOsuGameSourceChannel>
+    <PpyOsuGameVersion>2026.821.0</PpyOsuGameVersion>
+    <PpyOsuGameSourceChannel>tachyon</PpyOsuGameSourceChannel>
 
     <Product>OverlayAPI</Product>
     <Authors>Milkitic</Authors>
