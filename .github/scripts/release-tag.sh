@@ -4,7 +4,6 @@ set -euo pipefail
 
 TAG="${1:-}"
 PROJECT="osu.Game.Rulesets.OverlayAPI/osu.Game.Rulesets.OverlayAPI.csproj"
-ARTIFACT="osu.Game.Rulesets.OverlayAPI/bin/Release/net8.0/osu.Game.Rulesets.OverlayAPI.dll"
 REPLACE_EXISTING="${REPLACE_EXISTING:-false}"
 
 if [ -z "$TAG" ]; then
@@ -78,53 +77,72 @@ if gh release view "$TAG" >/dev/null 2>&1; then
   echo "::notice::GitHub Release $TAG exists; rebuilding and replacing its asset."
 fi
 
-# Channel tags (-lazer/-tachyon) are never published to nuget.org (ppy/osu
-# deploy.yml excludes `*-*`). When a channel target has no official package,
-# reproduce the package from the matching ppy/osu tag so `dotnet build` can
-# restore it. The package carries that tag's CURRENT_RULESET_API_VERSION, so
-# the built ruleset DLL matches the channel client exactly.
-nuget_has_version() {
-  local ver="$1"
-  curl --fail --silent --show-error --max-time 30 \
-    "https://api.nuget.org/v3-flatcontainer/ppy.osu.game/${ver}/ppy.osu.game.${ver}.nupkg" \
-    -o /dev/null
+# Download the exact package before restoring so its target framework can drive
+# the build. Historical release tags may target net8.0 even when the matching
+# osu! channel has moved to net10.0.
+LOCAL_NUGET_DIR="$RUNNER_TEMP/local-nuget"
+mkdir -p "$LOCAL_NUGET_DIR"
+PACKAGE_FILE="$LOCAL_NUGET_DIR/ppy.osu.game.${NUGET_VER}.nupkg"
+PACKAGE_STATUS="$(curl --silent --show-error --location --retry 3 \
+  --connect-timeout 10 --max-time 60 --write-out '%{http_code}' \
+  "https://api.nuget.org/v3-flatcontainer/ppy.osu.game/${NUGET_VER}/ppy.osu.game.${NUGET_VER}.nupkg" \
+  --output "$PACKAGE_FILE")" || {
+  echo "::error::Could not download ppy.osu.Game $NUGET_VER from nuget.org."
+  exit 1
 }
 
-# Use the channel recorded in the project for manual tags whose dependency came
-# from source. Channel tags always derive it from their own tag name.
-LOCAL_NUGET_DIR=""
-if [[ "$NUGET_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! nuget_has_version "$NUGET_VER"; then
+if [ "$PACKAGE_STATUS" = 404 ]; then
+  rm -f "$PACKAGE_FILE"
+  # Use the channel recorded in the project for manual tags whose dependency
+  # came from source. Channel tags derive it from their own tag name.
   case "$SOURCE_CHANNEL" in
     lazer|tachyon)
       echo "::notice::ppy.osu.Game $NUGET_VER is not on nuget.org; packing from ppy/osu tag ${NUGET_VER}-${SOURCE_CHANNEL}."
-      LOCAL_NUGET_DIR="$RUNNER_TEMP/local-nuget"
       PACK_HELPER="${PACK_OSU_FROM_SOURCE_SCRIPT:-$(dirname "$0")/pack-osu-from-source.sh}"
       bash "$PACK_HELPER" "$NUGET_VER" "$SOURCE_CHANNEL" "$LOCAL_NUGET_DIR"
+      PACKAGE_FILE="$LOCAL_NUGET_DIR/ppy.osu.Game.${NUGET_VER}.nupkg"
       ;;
     *)
       echo "::error::$TAG needs ppy.osu.Game $NUGET_VER, which is not on nuget.org, but its source channel is '${SOURCE_CHANNEL:-<missing>}'."
       exit 1
       ;;
   esac
+elif [ "$PACKAGE_STATUS" != 200 ]; then
+  echo "::error::nuget.org returned HTTP $PACKAGE_STATUS for ppy.osu.Game $NUGET_VER."
+  exit 1
 fi
+
+PACKAGE_ENTRIES="$(unzip -Z1 "$PACKAGE_FILE")" || {
+  echo "::error::Cannot inspect ppy.osu.Game package: $PACKAGE_FILE"
+  exit 1
+}
+PACKAGE_FRAMEWORKS="$(sed -nE 's#^lib/(net[0-9]+\.[0-9]+)/osu\.Game\.dll$#\1#p' <<< "$PACKAGE_ENTRIES" | sort -u)"
+if [[ ! "$PACKAGE_FRAMEWORKS" =~ ^net[0-9]+\.[0-9]+$ ]]; then
+  echo "::error::Expected one osu.Game target framework in $PACKAGE_FILE; found '${PACKAGE_FRAMEWORKS:-none}'."
+  exit 1
+fi
+echo "::notice::Building $TAG against ppy.osu.Game $NUGET_VER ($PACKAGE_FRAMEWORKS)."
 
 BUILD_VERSION_ARGS=()
 if [ "$PROJECT_NUGET_VER" != "$NUGET_VER" ]; then
   BUILD_VERSION_ARGS+=("/p:PpyOsuGameVersion=$NUGET_VER")
   echo "::notice::Overriding historical tag dependency $PROJECT_NUGET_VER with channel target $NUGET_VER."
 fi
-
-RESTORE_SOURCE_ARGS=()
-if [ -n "$LOCAL_NUGET_DIR" ]; then
-  RESTORE_SOURCE_ARGS+=(--source "$LOCAL_NUGET_DIR" --source https://api.nuget.org/v3/index.json)
-fi
+BUILD_VERSION_ARGS+=("/p:TargetFramework=$PACKAGE_FRAMEWORKS")
 
 # Restore explicitly so historical tags do not need a NuGet.config file from
 # main. Configuration must match the following no-restore build: ILRepack is a
 # Release-only PackageReference and a default Debug restore omits its targets.
-dotnet restore "$PROJECT" -p:Configuration=Release "${BUILD_VERSION_ARGS[@]}" "${RESTORE_SOURCE_ARGS[@]}"
+dotnet restore "$PROJECT" -p:Configuration=Release "${BUILD_VERSION_ARGS[@]}" \
+  --source "$LOCAL_NUGET_DIR" --source https://api.nuget.org/v3/index.json
+# ProjectReference framework negotiation still builds the protocol project at
+# the framework declared by the checked-out tag. Restore that target explicitly:
+# old tags declare net8.0 even when osu.Game now requires net10.0.
+dotnet restore OverlayAPI.LazerProtocol/OverlayAPI.LazerProtocol.csproj -p:Configuration=Release \
+  --source "$LOCAL_NUGET_DIR" --source https://api.nuget.org/v3/index.json
 dotnet build "$PROJECT" -c Release --no-restore "${BUILD_VERSION_ARGS[@]}"
 
+ARTIFACT="osu.Game.Rulesets.OverlayAPI/bin/Release/$PACKAGE_FRAMEWORKS/osu.Game.Rulesets.OverlayAPI.dll"
 if [ ! -f "$ARTIFACT" ]; then
   echo "::error::Expected final ILRepack artifact was not found: $ARTIFACT"
   exit 1
