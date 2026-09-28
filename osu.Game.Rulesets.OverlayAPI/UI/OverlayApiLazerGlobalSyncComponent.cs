@@ -242,6 +242,11 @@ internal sealed partial class OverlayApiLazerGlobalSyncComponent : Component
 
     private void BindGameplayEvents(Player? player)
     {
+        // A screen becomes current while it is still loading. GameplayState may already exist at
+        // that point, but its ScoreProcessor has not yet received a clock from the drawable tree.
+        if (player?.IsLoaded != true || player.GameplayState?.ScoreProcessor?.IsLoaded != true)
+            player = null;
+
         var changed = false;
 
         if (!ReferenceEquals(boundPlayer, player))
@@ -452,8 +457,9 @@ internal sealed partial class OverlayApiLazerGlobalSyncComponent : Component
 
     private int GetPlayTime()
     {
-        if (boundScoreProcessor != null && double.IsFinite(boundScoreProcessor.Clock.CurrentTime))
-            return (int)Math.Round(boundScoreProcessor.Clock.CurrentTime);
+        var gameplayTime = boundScoreProcessor?.Clock?.CurrentTime;
+        if (gameplayTime is { } time && double.IsFinite(time))
+            return (int)Math.Round(time);
 
         var beatmap = workingBeatmap?.Value;
         if (beatmap?.TrackLoaded == true && double.IsFinite(beatmap.Track.CurrentTime))
@@ -495,7 +501,7 @@ internal sealed partial class OverlayApiLazerGlobalSyncComponent : Component
         if (boundPlayer is ReplayPlayer or SpectatorPlayer)
             return true;
 
-        return boundPlayer?.GameplayState.Mods.Any(static mod => mod is ModAutoplay) == true;
+        return boundPlayer?.GameplayState?.Mods.Any(static mod => mod is ModAutoplay) == true;
     }
 
     // lazer's built-in "random skin" virtual entry (SkinInfo.RANDOM_SKIN in osu.Game).
