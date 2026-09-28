@@ -198,7 +198,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Fetch release tooling from main
         run: git fetch origin main:refs/remotes/origin/main
