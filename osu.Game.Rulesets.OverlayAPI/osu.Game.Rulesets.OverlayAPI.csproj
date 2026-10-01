@@ -4,7 +4,7 @@
     <OutputType>Library</OutputType>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <PpyOsuGameVersion>2026.918.0</PpyOsuGameVersion>
+    <PpyOsuGameVersion>2026.1001.0</PpyOsuGameVersion>
     <PpyOsuGameSourceChannel>tachyon</PpyOsuGameSourceChannel>
 
     <Product>OverlayAPI</Product>
